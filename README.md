@@ -190,21 +190,117 @@ meteor-worker/StorageAdapterSpec      4  — PartitionWriter↔StorageAdapter
 - macOS (Apple Silicon), Java 21
 - 模式: Local in-memory shuffle (Meteor Master 不可用，自动降级)
 
-**测试 Job 拓扑**:
-```
-Source(1) ──forward──→ FlatMap(2) ──keyBy──→ KeyedReduce(2) ──forward──→ Sink(1)
-```
-
-**数据集**: 80 条 (apple×10, banana×10, cherry×10, date×10, elderberry×10, fig×10, grape×10, honeydew×10)
-
-**预期输出**: reduce 按 key 聚合计数
-```
-apple-1 → 1, apple-2 → 1, ..., banana-1 → 2, banana-2 → 2, ..., cherry-1 → 3, ...
-```
-
 **结果**: ✅ 全部 80 条数据正确处理，reduce 聚合准确
 
-**修复的关键 bug**:
+#### 测试架构
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                         Flink Standalone (单节点)                            │
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐  │
+│  │                     TaskManager (4 slots)                             │  │
+│  │                                                                       │  │
+│  │   ┌──────────┐    ┌──────────┐    ┌───────────────┐    ┌──────────┐  │  │
+│  │   │  Source   │───→│ FlatMap  │───→│ KeyedReduce   │───→│   Sink   │  │  │
+│  │   │  (1/1)   │    │ (1/2)    │    │   (1/2)       │    │  (1/1)   │  │  │
+│  │   └──────────┘    ├──────────┤    ├───────────────┤    └──────────┘  │  │
+│  │                   │ FlatMap  │───→│ KeyedReduce   │                   │  │
+│  │                   │ (2/2)    │    │   (2/2)       │                   │  │
+│  │                   └──────────┘    └───────────────┘                   │  │
+│  │                                                                       │  │
+│  │   ┌────────────────────────────────────────────────────────────────┐  │  │
+│  │   │          Meteor Shuffle Plugin (in-memory)                     │  │  │
+│  │   │                                                                │  │
+│  │   │  MeteorShuffleMaster ← registerPartitionWithProducer()         │  │
+│  │   │  MeteorShuffleEnvironment ← createInputGates()                │  │
+│  │   │  MeteorResultPartitionWriter[] ← subpartitionQueues (CLQ)     │  │
+│  │   │  MeteorIndexedInputGate[] ← pollNext() → BufferOrEvent        │  │
+│  │   └────────────────────────────────────────────────────────────────┘  │  │
+│  └────────────────────────────────────────────────────────────────────────┘  │
+│                                                                              │
+│  ┌────────────────────────────────────────────────────────────────────────┐  │
+│  │                     JobManager                                         │  │
+│  │   shuffle-service-factory.class = MeteorShuffleServiceFactory         │  │
+│  └────────────────────────────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Job 拓扑
+
+```
+Source(1) ──forward──→ FlatMap(2) ──keyBy──→ KeyedReduce(2) ──forward──→ Sink(1)
+         (chained)              (shuffle)                   (chained)
+
+Dataset: 80 items (apple×10, banana×10, ..., honeydew×10)
+Output:  apple-1→1, banana-2→2, cherry-3→3, date-4→4, ...
+```
+
+#### Local In-Memory Shuffle 数据流
+
+```
+                           ┌─────────────────────────────────────┐
+                           │   MeteorResultPartitionWriter       │
+                           │                                     │
+ WriterTask                │   subpartitionQueues[0] ── CLQ ──┐  │
+ (e.g. FlatMap)            │   subpartitionQueues[1] ── CLQ ──┤  │
+      │                    │                                   │  │
+      │ emitRecord()       │   BufferBuilder[0] ──────────────┤  │
+      │ ───────────────→   │   BufferBuilder[1] ──────────────┤  │
+      │                    │                                   │  │
+      │ finishCurrentBuffer│         notifyDataAvailable()     │  │
+      │ ───────────────→   │   ──→ listener.notifyDataAvailable│  │
+      │                    │       │                           │  │
+      │                    └───────┼───────────────────────────┘  │
+      │                            │                              │
+      │                            ▼                              │
+      │                    ┌───────────────────────────────────────┤
+      │                    │   MeteorIndexedInputGate             │
+      │                    │                                      │
+      │                    │   drainView()                        │
+      │                    │     view.getNextBuffer()             │
+      │                    │       └→ queue[subIdx].poll()        │
+      │                    │     → resultQueue.add(BufferOrEvent) │
+      │                    │                                      │
+ ReaderTask                │   pollNext()                         │
+ (e.g. KeyedReduce)       │     └→ resultQueue.poll()            │
+      │                    │        → Optional<BufferOrEvent>     │
+      │                    └───────────────────────────────────────┘
+      │
+      │  processElement()
+      ▼
+```
+
+#### SPI 加载流程
+
+```
+Flink JobManager 启动
+  │
+  ├─ SPI: ServiceLoader.load(ShuffleServiceFactory)
+  │    └─ META-INF/services/org.apache.flink.runtime.shuffle.ShuffleServiceFactory
+  │         └─ cn.xuyinyin.meteor.spi.MeteorShuffleServiceFactory
+  │
+  ├─ MeteorShuffleServiceFactory.createShuffleMaster()
+  │    └─ new MeteorShuffleMaster()
+  │         └─ 注册到 descriptorCache: TrieMap[JobID → MeteorShuffleDescriptor]
+  │
+  └─ MeteorShuffleServiceFactory.createShuffleEnvironment()
+       └─ new MeteorShuffleEnvironment()
+            ├─ registerResultPartitionWriters():
+            │    ├─ new MeteorResultPartitionWriter(partitionId, numSubs)
+            │    ├─ MeteorPluginContext.registerLocalPartition(rpid, writer)
+            │    └─ return writer
+            │
+            └─ createInputGates():
+                 ├─ getShuffleDescriptors → MeteorShuffleDescriptor[]
+                 ├─ MeteorPluginContext.getLocalPartition(rpid) → writer
+                 ├─ writer.createSubpartitionView(subIdx, listener)
+                 │    └─ new MeteorSubpartitionView(writer, listener, subIdx)
+                 └─ new MeteorIndexedInputGate(views, channelInfos)
+                      └─ pollNext(): resultQueue.poll() → BufferOrEvent
+```
+
+#### 关键修复
 
 | # | 问题 | 根因 | 修复方案 |
 |---|------|------|----------|
@@ -213,15 +309,6 @@ apple-1 → 1, apple-2 → 1, ..., banana-1 → 2, banana-2 → 2, ..., cherry-1
 | 3 | 小 record 永远不被 flush | `emitRecord` 只在 buffer 满 (32KB) 时 flush，record ~20B | 每次 `emitRecord` 后立即 `finishCurrentBuffer` + `notifyDataAvailable` |
 | 4 | `createSubpartitionView` OOB | 传入 `numPartitions` (2) 作为 index，创建 range [2,2] | 改用 `new ResultSubpartitionIndexSet(subIdx)` |
 | 5 | Scala 2.13/2.12 运行时不兼容 | Flink 1.19 绑定 Scala 2.12，`ScalaRunTime$.wrapRefArray` 签名不同 | 全项目迁移到 Scala 2.12.20 |
-
-**Local in-memory shuffle 数据流**:
-```
-emitRecord() → BufferBuilder.append()
-  → finishCurrentBuffer() → BufferAndBacklog 入 ConcurrentLinkedQueue[subpartition]
-  → notifyDataAvailable() → BufferAvailabilityListener
-  → drainView() → view.getNextBuffer() → queue.poll()
-  → resultQueue → pollNext() → BufferOrEvent
-```
 
 ## Roadmap
 
