@@ -18,7 +18,11 @@ object MasterEvents {
     excludedWorkers: Set[String] = Set.empty,                    // blacklisted worker ids
     workerFailureCounts: Map[String, Int] = Map.empty,           // workerId -> consecutive failures
     shuttingDown: Boolean = false,                               // 优雅关闭标志
-    shuffleRegisterTimestamps: Map[ShuffleId, Long] = Map.empty  // shuffle注册时间戳（用于过期清理）
+    shuffleRegisterTimestamps: Map[ShuffleId, Long] = Map.empty,  // shuffle注册时间戳（用于过期清理）
+    // 两阶段提交追踪
+    shuffleNumMappers: Map[ShuffleId, Int] = Map.empty,          // shuffle → 总 mapper 数
+    mapperCompletions: Map[ShuffleId, Set[Int]] = Map.empty,     // shuffle → 已完成的 mapper id 集合
+    shuffleCommitted: Set[ShuffleId] = Set.empty                  // 已完成 CommitShuffle 的 shuffle
   )
 
   final case class WorkerInfo(
@@ -66,7 +70,8 @@ object MasterEvents {
   final case class ShuffleRegistered(
     shuffleId: ShuffleId,
     numPartitions: Int,
-    locations: Seq[PartitionLocation]
+    locations: Seq[PartitionLocation],
+    numMappers: Int = 1   // 用于两阶段提交追踪
   ) extends Event
 
   final case class ShuffleRevived(
@@ -105,6 +110,17 @@ object MasterEvents {
 
   case object ShuttingDown extends Event
 
+  /** 两阶段提交：单个 mapper 完成 */
+  final case class MapperCompleted(
+    shuffleId: ShuffleId,
+    mapperId: Int
+  ) extends Event
+
+  /** 两阶段提交：所有 mapper 完成，CommitShuffle 已广播 */
+  final case class ShuffleCommitted(
+    shuffleId: ShuffleId
+  ) extends Event
+
   // ================================
   // Event Sourcing 状态机
   // ================================
@@ -137,11 +153,12 @@ object MasterEvents {
       }
       state.copy(workers = state.workers - id, shuffles = remainingShuffles)
 
-    case ShuffleRegistered(sid, _, locs) =>
+    case ShuffleRegistered(sid, _, locs, nMappers) =>
       val partitions = locs.map(l => l.id.partitionIndex -> l).toMap
       state.copy(
         shuffles = state.shuffles + (sid -> ShuffleInfo(sid, partitions)),
-        shuffleRegisterTimestamps = state.shuffleRegisterTimestamps + (sid -> System.currentTimeMillis())
+        shuffleRegisterTimestamps = state.shuffleRegisterTimestamps + (sid -> System.currentTimeMillis()),
+        shuffleNumMappers = state.shuffleNumMappers + (sid -> nMappers)
       )
 
     case ShuffleRevived(sid, pidx, _, _, newLoc) =>
@@ -156,7 +173,10 @@ object MasterEvents {
       state.copy(
         shuffles = state.shuffles - sid,
         committedPartitions = state.committedPartitions - sid,
-        shuffleRegisterTimestamps = state.shuffleRegisterTimestamps - sid
+        shuffleRegisterTimestamps = state.shuffleRegisterTimestamps - sid,
+        shuffleNumMappers = state.shuffleNumMappers - sid,
+        mapperCompletions = state.mapperCompletions - sid,
+        shuffleCommitted = state.shuffleCommitted - sid
       )
 
     case PartitionSplit(sid, pidx, count) =>
@@ -196,5 +216,17 @@ object MasterEvents {
 
     case ShuttingDown =>
       state.copy(shuttingDown = true)
+
+    case MapperCompleted(sid, mapperId) =>
+      val existing = state.mapperCompletions.getOrElse(sid, Set.empty)
+      val newDone = existing + mapperId
+      val totalMappers = state.shuffleNumMappers.getOrElse(sid, 1)
+      val s1 = state.copy(mapperCompletions = state.mapperCompletions + (sid -> newDone))
+      // 所有 mapper 完成 → 自动标记 shuffle committed
+      if (newDone.size >= totalMappers) s1.copy(shuffleCommitted = s1.shuffleCommitted + sid)
+      else s1
+
+    case ShuffleCommitted(sid) =>
+      state.copy(shuffleCommitted = state.shuffleCommitted + sid)
   }
 }

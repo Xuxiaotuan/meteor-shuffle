@@ -36,6 +36,10 @@ object WorkerActor {
   final case class HandleFetchData(req: FetchData, replyTo: ActorRef[FetchDataResponse]) extends Command
   final case class HandleReplicateData(req: ReplicateData, replyTo: ActorRef[ReplicateDataResponse]) extends Command
 
+  // ===== 流式/分块 Fetch =====
+  final case class HandleFetchChunk(req: FetchChunk, replyTo: ActorRef[FetchChunkResponse]) extends Command
+  final case class HandleFetchChunkRange(req: FetchChunkRange, replyTo: ActorRef[FetchChunkRangeResponse]) extends Command
+
   /** 从副本恢复数据（故障转移时 Master 通知新 Primary 去 replica 拉数据） */
   final case class HandleRecoverFromReplica(
     req: RecoverFromReplica,
@@ -43,7 +47,7 @@ object WorkerActor {
   ) extends Command
 
   /** 异步副本同步完成回调 */
-  private final case class ReplicaAck(
+  private final case class InternalReplicaAck(
     partitionKey: String,
     success: Boolean,
     clientReplyTo: ActorRef[PushDataResponse],
@@ -53,6 +57,9 @@ object WorkerActor {
 
   // ===== 控制面 =====
   final case class HandleReleaseSlots(req: ReleaseSlots) extends Command
+
+  // ===== 两阶段提交 =====
+  final case class HandleCommitShuffle(req: CommitShuffle, replyTo: ActorRef[CommitShuffleResponse]) extends Command
 
   // ===== 分区提交（标记完成，允许 Fetch） =====
   final case class HandleCommitPartition(shuffleId: ShuffleId, partitionIndex: Int, attemptNumber: Int) extends Command
@@ -90,11 +97,22 @@ object WorkerActor {
 
   private val nextWorkerId = new AtomicInteger(1)
 
+  /** S3/MinIO 存储配置 */
+  final case class S3Config(
+    endpoint: String,         // MinIO: http://localhost:9000, AWS: https://s3.amazonaws.com
+    accessKey: String,
+    secretKey: String,
+    bucket: String,
+    region: String = "us-east-1",
+    enabled: Boolean = true   // 是否启用 S3 二级存储
+  )
+
   /**
    * @param storageDirs 数据存储目录列表（多盘做 free-space-aware 选择）
    * @param host        本机 IP
    * @param port        数据端口
    * @param splitThreshold 分区拆分阈值（字节），默认 256MB
+   * @param s3Config    可选的 S3/MinIO 配置（启用二级存储）
    */
   def apply(
     storageDirs: Seq[String],
@@ -102,7 +120,9 @@ object WorkerActor {
     port: Int = 9000,
     splitThreshold: Long = 268435456L,   // 256MB
     dataPort: Int = 0,  // 0 = 禁用 Netty transport，>0 = 启用
-    rpcPort: Int = 0
+    rpcPort: Int = 0,
+    s3Config: Option[S3Config] = None,   // S3/MinIO 配置
+    flushInterval: FiniteDuration = 5.seconds  // 周期性刷盘间隔
   ): Behavior[Command] = Behaviors.setup { ctx =>
     ctx.log.info(s"=== Meteor Worker starting on $host:$port ===")
     ctx.log.info(s"Storage dirs: ${storageDirs.mkString(", ")} (free-space-aware)")
@@ -141,6 +161,18 @@ object WorkerActor {
       "disk-monitor"
     )
 
+    // 启动周期性 Flusher（对标 Celeborn Worker Flusher）
+    val flusherRef = ctx.spawn(
+      PeriodicFlusher(flushInterval = flushInterval),
+      "periodic-flusher"
+    )
+
+    // 初始化 S3/MinIO 二级存储（可选）
+    val s3Storage: Option[S3StorageAdapter] = s3Config.filter(_.enabled).map { cfg =>
+      ctx.log.info(s"S3 storage enabled: endpoint=${cfg.endpoint}, bucket=${cfg.bucket}")
+      new S3StorageAdapter(cfg.endpoint, cfg.accessKey, cfg.secretKey, cfg.bucket, cfg.region)
+    }
+
     ctx.log.info(s"Worker address: $workerAddress")
 
     // 缓存磁盘状态（由 DiskMonitor 定时更新）
@@ -155,7 +187,9 @@ object WorkerActor {
       shuttingDown = false,
       splitThreshold = splitThreshold,
       transportClient = transportClient,
-      transportServer = transportServer)
+      transportServer = transportServer,
+      s3Storage = s3Storage,
+      flusherRef = flusherRef)
   }
 
   // ================================
@@ -174,7 +208,9 @@ object WorkerActor {
     shuttingDown: Boolean,
     splitThreshold: Long,
     transportClient: Option[TransportClient],
-    transportServer: Option[TransportServer]
+    transportServer: Option[TransportServer],
+    s3Storage: Option[S3StorageAdapter],
+    flusherRef: ActorRef[PeriodicFlusher.Command]
   ): Behavior[Command] = Behaviors.receiveMessage {
 
     case MasterFound(listing) =>
@@ -183,7 +219,7 @@ object WorkerActor {
           ctx.log.info("[Discovery] Master found!")
           val newMaster = Some(masterRef.asInstanceOf[ActorRef[MasterActorCommand]])
           ctx.self ! TryRegister
-          discovering(ctx, storageDirs, newMaster, address, partitionData, partitionSizes, splitCounts, partitionCompression, diskStatuses, shuttingDown, splitThreshold, transportClient, transportServer)
+          discovering(ctx, storageDirs, newMaster, address, partitionData, partitionSizes, splitCounts, partitionCompression, diskStatuses, shuttingDown, splitThreshold, transportClient, transportServer, s3Storage, flusherRef)
         case None =>
           Behaviors.same
       }
@@ -199,7 +235,7 @@ object WorkerActor {
             RegisterWorker(address, diskSlots = storageDirs.size * 4, memorySlots = 128),
             replyAdapter
           )
-          active(ctx, storageDirs, master, address, workerId, partitionData, partitionSizes, splitCounts, partitionCompression, diskStatuses, shuttingDown, splitThreshold, transportClient, transportServer)
+          active(ctx, storageDirs, master, address, workerId, partitionData, partitionSizes, splitCounts, partitionCompression, diskStatuses, shuttingDown, splitThreshold, transportClient, transportServer, s3Storage, flusherRef)
         case None =>
           ctx.scheduleOnce(5.seconds, ctx.self, TryRegister)
           Behaviors.same
@@ -207,17 +243,18 @@ object WorkerActor {
 
     case RegistrationSuccess(resp) =>
       ctx.log.info(s"[Register] success! workerId=${resp.workerId}")
-      active(ctx, storageDirs, master, address, resp.workerId, partitionData, partitionSizes, splitCounts, partitionCompression, diskStatuses, shuttingDown, splitThreshold, transportClient, transportServer)
+      active(ctx, storageDirs, master, address, resp.workerId, partitionData, partitionSizes, splitCounts, partitionCompression, diskStatuses, shuttingDown, splitThreshold, transportClient, transportServer, s3Storage, flusherRef)
 
     case DiskStatusUpdated(status) =>
       // 更新磁盘状态缓存
       status.storageDirs.foreach(d => diskStatuses.put(d.path, d))
-      discovering(ctx, storageDirs, master, address, partitionData, partitionSizes, splitCounts, partitionCompression, diskStatuses, shuttingDown, splitThreshold, transportClient, transportServer)
+      discovering(ctx, storageDirs, master, address, partitionData, partitionSizes, splitCounts, partitionCompression, diskStatuses, shuttingDown, splitThreshold, transportClient, transportServer, s3Storage, flusherRef)
 
     case GracefulShutdown =>
       ctx.log.info("Worker shutdown requested (not yet registered)")
       transportClient.foreach(_.close())
       transportServer.foreach(_.close())
+      s3Storage.foreach(_.close())
       Behaviors.stopped
 
     case _ =>
@@ -241,7 +278,9 @@ object WorkerActor {
     shuttingDown: Boolean,
     splitThreshold: Long,
     transportClient: Option[TransportClient],
-    transportServer: Option[TransportServer]
+    transportServer: Option[TransportServer],
+    s3Storage: Option[S3StorageAdapter],
+    flusherRef: ActorRef[PeriodicFlusher.Command]
   ): Behavior[Command] = {
 
     ctx.scheduleOnce(10.seconds, ctx.self, SendHeartbeat)
@@ -262,7 +301,7 @@ object WorkerActor {
         ctx.scheduleOnce(10.seconds, ctx.self, SendHeartbeat)
         Behaviors.same
 
-      // ===== PushData（含 Checksum 校验 + 副本同步 + 分区拆分 + 指标打点） =====
+      // ===== PushData（含 Checksum 校验 + 同步/异步副本 + 周期性刷盘注册 + S3 写回） =====
       case HandlePushData(req, replyTo) =>
         val startNanos = System.nanoTime()
         Metrics.WorkerMetrics.pushDataRequests.inc()
@@ -289,26 +328,32 @@ object WorkerActor {
               new PartitionWriter(dir, req.shuffleId, req.partitionIndex, req.attemptNumber)
             })
 
-            // 压缩策略：客户端已压缩则直接存，否则存原始数据
-            val dataToStore = if (req.compression != CompressNone) {
-              req.data  // 客户端已压缩，直接存
-            } else {
-              req.data  // 不压缩
-            }
+            val dataToStore = req.data
             writer.write(dataToStore)
             if (req.compression != CompressNone) {
               partitionCompression.put(writeKey, req.compression)
             }
 
-            // 指标：记录写入字节数 + 更新磁盘用量
+            // 注册到周期性 Flusher
+            flusherRef ! PeriodicFlusher.RegisterWriter(writeKey, writer)
+
             Metrics.WorkerMetrics.pushDataBytes.inc(req.data.length)
             Metrics.WorkerMetrics.diskUsage.inc(req.data.length)
 
-            // 2. 拆分检测：超过阈值则创建新子分区并通知 Master
+            // S3 写回（异步，可选）
+            s3Storage.foreach { s3 =>
+              import scala.concurrent.ExecutionContext.Implicits.global
+              ctx.executionContext.execute(() => {
+                try { s3.write(writeKey, dataToStore) }
+                catch { case e: Exception => ctx.log.warn(s"S3 write-back failed for $writeKey: ${e.getMessage}") }
+              })
+            }
+
+            // 2. 拆分检测
             val currentSize = partitionSizes.computeIfAbsent(writeKey, _ => new AtomicLong(0)).addAndGet(req.data.length)
             if (currentSize > splitThreshold && splitThreshold > 0) {
               val newCount = splitCounts.compute(key, (_, v) => if (v == 0) 1 else v + 1)
-              partitionSizes.remove(writeKey) // 重置当前子分区计数
+              partitionSizes.remove(writeKey)
               ctx.log.info(s"Partition split: ${req.shuffleId}[${req.partitionIndex}] → $newCount sub-partitions (${currentSize} bytes)")
               master.foreach { m =>
                 m ! MasterActorCommand.WrappedReportPartitionSplit(
@@ -317,11 +362,13 @@ object WorkerActor {
               }
             }
 
-            // 3. 副本同步：优先 Netty TransportClient，fallback Pekko
-            req.replica.foreach { replicaAddr =>
+            // 3. 副本同步：支持同步/异步两种模式
+            val needsSyncReplica = req.requireSyncReplica && req.replica.isDefined
+
+            if (req.replica.isDefined) {
+              val replicaAddr = req.replica.get
               transportClient match {
                 case Some(client) =>
-                  // Netty 直连路径
                   val body = TransportCodec.PushBody(
                     appId = req.shuffleId.appId,
                     shuffleIndex = req.shuffleId.shuffleNum,
@@ -329,31 +376,58 @@ object WorkerActor {
                     attemptNumber = req.attemptNumber,
                     data = req.data,
                     checksum = req.checksum,
-                    compression = 0  // 原始数据不解压
+                    compression = 0
                   )
                   import scala.concurrent.ExecutionContext.Implicits.global
-                  client.replicate(replicaAddr.host, replicaAddr.port, body).foreach { success =>
-                    if (!success) ctx.log.warn(s"Netty replica failed to ${replicaAddr.host}:${replicaAddr.port}")
+                  val replicaFuture = client.replicate(replicaAddr.host, replicaAddr.port, body)
+
+                  if (needsSyncReplica) {
+                    // 同步副本模式：等待副本确认再 ack client，消除数据丢失窗口
+                    replicaFuture.onComplete { result =>
+                      val success = result.isSuccess && result.get
+                      if (!success) ctx.log.warn(s"Sync replica failed to ${replicaAddr.host}:${replicaAddr.port}")
+                      replyTo ! PushDataResponse(req.shuffleId, req.partitionIndex, success = true)
+                    }(ctx.executionContext)
+                  } else {
+                    // 异步副本模式：先 ack client，副本后台完成
+                    replicaFuture.foreach { success =>
+                      if (!success) ctx.log.warn(s"Async replica failed to ${replicaAddr.host}:${replicaAddr.port}")
+                    }(ctx.executionContext)
+                    replyTo ! PushDataResponse(req.shuffleId, req.partitionIndex, success = true)
                   }
 
                 case None =>
-                  // Pekko actorSelection fallback
-                  val repData = ReplicateData(req.shuffleId, req.partitionIndex, req.attemptNumber, req.data)
-                  val path = s"pekko://meteor-worker@${replicaAddr.host}:${replicaAddr.rpcPort}/user/worker"
-
-                  import org.apache.pekko.actor.typed.scaladsl.adapter._
-                  val classicSystem = ctx.system.toClassic
-                  classicSystem.actorSelection(path).resolveOne(5.seconds).onComplete {
-                    case scala.util.Success(ref) =>
-                      ctx.self ! ReplicaResolved(repData, ref)
-                    case scala.util.Failure(ex) =>
-                      ctx.log.warn(s"Failed to resolve replica worker: $path - ${ex.getMessage}")
-                  }(ctx.executionContext)
+                  if (needsSyncReplica) {
+                    // Pekko fallback: 也需要等副本确认
+                    val repData = ReplicateData(req.shuffleId, req.partitionIndex, req.attemptNumber, req.data)
+                    val path = s"pekko://meteor-worker@${replicaAddr.host}:${replicaAddr.rpcPort}/user/worker"
+                    import org.apache.pekko.actor.typed.scaladsl.adapter._
+                    val classicSystem = ctx.system.toClassic
+                    classicSystem.actorSelection(path).resolveOne(5.seconds).onComplete {
+                      case scala.util.Success(ref) =>
+                        ctx.self ! ReplicaResolved(repData, ref)
+                        // 不在这里 ack，等 ReplicaAck 回调
+                      case scala.util.Failure(ex) =>
+                        ctx.log.warn(s"Failed to resolve replica worker: $path - ${ex.getMessage}")
+                        replyTo ! PushDataResponse(req.shuffleId, req.partitionIndex, success = true) // 本地已写入
+                    }(ctx.executionContext)
+                  } else {
+                    // 异步副本
+                    val repData = ReplicateData(req.shuffleId, req.partitionIndex, req.attemptNumber, req.data)
+                    val path = s"pekko://meteor-worker@${replicaAddr.host}:${replicaAddr.rpcPort}/user/worker"
+                    import org.apache.pekko.actor.typed.scaladsl.adapter._
+                    val classicSystem = ctx.system.toClassic
+                    classicSystem.actorSelection(path).resolveOne(5.seconds).onComplete {
+                      case scala.util.Success(ref) => ref ! HandleReplicateData(repData, ctx.system.deadLetters)
+                      case scala.util.Failure(ex) => ctx.log.warn(s"Failed to resolve replica: $path - ${ex.getMessage}")
+                    }(ctx.executionContext)
+                    replyTo ! PushDataResponse(req.shuffleId, req.partitionIndex, success = true)
+                  }
               }
+            } else {
+              // 无副本：直接 ack
+              replyTo ! PushDataResponse(req.shuffleId, req.partitionIndex, success = true)
             }
-
-            // 4. 立即 ack Client（副本异步同步）
-            replyTo ! PushDataResponse(req.shuffleId, req.partitionIndex, success = true)
           }
         } catch {
           case ex: Exception =>
@@ -361,7 +435,6 @@ object WorkerActor {
             Metrics.WorkerMetrics.pushDataFailures.inc()
             replyTo ! PushDataResponse(req.shuffleId, req.partitionIndex, success = false)
         } finally {
-          // 记录延迟
           val latencySec = (System.nanoTime() - startNanos) / 1e9
           Metrics.WorkerMetrics.pushLatency.observe(latencySec)
         }
@@ -383,7 +456,59 @@ object WorkerActor {
           Metrics.WorkerMetrics.fetchDataBytes.inc(data.length)
           replyTo ! FetchDataResponse(req.shuffleId, req.partitionIndex, Some(data))
         } else {
-          replyTo ! FetchDataResponse(req.shuffleId, req.partitionIndex, None)
+          // 尝试从 S3 恢复
+          s3Storage.flatMap(_.readComplete(key)) match {
+            case Some(data) =>
+              Metrics.WorkerMetrics.fetchDataBytes.inc(data.length)
+              replyTo ! FetchDataResponse(req.shuffleId, req.partitionIndex, Some(data))
+            case None =>
+              replyTo ! FetchDataResponse(req.shuffleId, req.partitionIndex, None)
+          }
+        }
+        Behaviors.same
+
+      // ===== FetchChunk：按 chunk 流式/分块读取 =====
+      case HandleFetchChunk(req, replyTo) =>
+        val key = partitionKey(req.shuffleId, req.partitionIndex, req.attemptNumber)
+        val writer = partitionData.get(key)
+        if (writer != null && writer.isComplete) {
+          if (req.chunkIndex == -1) {
+            // 查询 chunk 总数
+            replyTo ! FetchChunkResponse(req.shuffleId, req.partitionIndex, -1, writer.numChunks, Array.emptyByteArray)
+          } else {
+            writer.readChunk(req.chunkIndex) match {
+              case Some(chunkData) =>
+                replyTo ! FetchChunkResponse(req.shuffleId, req.partitionIndex, req.chunkIndex, writer.numChunks, chunkData)
+              case None =>
+                replyTo ! FetchChunkResponse(req.shuffleId, req.partitionIndex, req.chunkIndex, writer.numChunks, Array.emptyByteArray)
+            }
+          }
+        } else {
+          // 尝试从 S3 恢复（S3 不支持分块，返回全量作为单 chunk）
+          s3Storage.flatMap(_.readComplete(key)) match {
+            case Some(data) =>
+              replyTo ! FetchChunkResponse(req.shuffleId, req.partitionIndex, 0, 1, data)
+            case None =>
+              replyTo ! FetchChunkResponse(req.shuffleId, req.partitionIndex, -1, 0, Array.emptyByteArray)
+          }
+        }
+        Behaviors.same
+
+      // ===== FetchChunkRange：批量 chunk 读取（流式拉取） =====
+      case HandleFetchChunkRange(req, replyTo) =>
+        Metrics.WorkerMetrics.fetchDataRequests.inc()
+        val key = partitionKey(req.shuffleId, req.partitionIndex, req.attemptNumber)
+        val writer = partitionData.get(key)
+        if (writer != null && writer.isComplete) {
+          val chunks = (req.startChunk to req.endChunk).flatMap { idx =>
+            writer.readChunk(idx)
+          }
+          var totalBytes = 0L
+          chunks.foreach(c => totalBytes += c.length)
+          Metrics.WorkerMetrics.fetchDataBytes.inc(totalBytes)
+          replyTo ! FetchChunkRangeResponse(req.shuffleId, req.partitionIndex, chunks, writer.numChunks)
+        } else {
+          replyTo ! FetchChunkRangeResponse(req.shuffleId, req.partitionIndex, Seq.empty, 0)
         }
         Behaviors.same
 
@@ -527,13 +652,44 @@ object WorkerActor {
         Metrics.WorkerMetrics.partitionWriters.set(partitionData.size())
         Behaviors.same
 
+      // ===== CommitShuffle（两阶段提交阶段二）：Master 通知所有 mapper 已完成 =====
+      case HandleCommitShuffle(req, replyTo) =>
+        val prefix = s"${req.shuffleId.appId}:${req.shuffleId.shuffleNum}"
+        ctx.log.info(s"CommitShuffle triggered for $prefix: flushing and finalizing all partitions")
+
+        // 1. 找到该 shuffle 的所有 partition writer
+        var finalizedCount = 0
+        val keys = partitionData.keys()
+        while (keys.hasMoreElements) {
+          val key = keys.nextElement()
+          if (key.startsWith(prefix)) {
+            val writer = partitionData.get(key)
+            if (writer != null && !writer.isComplete) {
+              try {
+                writer.close()  // flush + fsync + mark complete
+                // 注销周期性 flusher
+                flusherRef ! PeriodicFlusher.UnregisterWriter(key)
+                finalizedCount += 1
+              } catch {
+                case e: Exception =>
+                  ctx.log.error(s"Error finalizing $key during CommitShuffle: ${e.getMessage}")
+              }
+            }
+          }
+        }
+
+        // 2. 通知 Master 提交结果
+        ctx.log.info(s"CommitShuffle complete: $finalizedCount partitions finalized for $prefix")
+        replyTo ! CommitShuffleResponse(req.shuffleId, success = true)
+        Behaviors.same
+
       // ===== 磁盘状态更新 =====
       case DiskStatusUpdated(status) =>
         status.storageDirs.foreach(d => diskStatuses.put(d.path, d))
         Behaviors.same
 
       // ===== 发现态回音（活跃态静默） =====
-      case MasterFound(_) | RegistrationSuccess(_) | TryRegister | ReplicaAck(_, _, _, _, _) =>
+      case MasterFound(_) | RegistrationSuccess(_) | TryRegister | InternalReplicaAck(_, _, _, _, _) =>
         Behaviors.same
 
       // ===== 状态查询 =====
@@ -583,6 +739,7 @@ object WorkerActor {
         partitionData.clear()
         transportClient.foreach(_.close())
         transportServer.foreach(_.close())
+        s3Storage.foreach(_.close())
         Metrics.WorkerMetrics.partitionWriters.set(0)
         ctx.log.info(s"Worker $workerId shutdown complete.")
         Behaviors.stopped
@@ -817,12 +974,19 @@ class PartitionWriter(
   def close(): Unit = {
     if (complete) return
     complete = true
+    flush()
     for (ch <- chunks) {
-      if (ch.size > 0) {
-        ch.channel.force(true)
-      }
       ch.channel.close()
       ch.raf.close()
+    }
+  }
+
+  /** 刷盘但不关闭（周期性 fsync） */
+  def flush(): Unit = {
+    for (ch <- chunks) {
+      if (ch.size > 0) {
+        ch.channel.force(false)  // false = 只刷数据不刷元数据（更快）
+      }
     }
   }
 }

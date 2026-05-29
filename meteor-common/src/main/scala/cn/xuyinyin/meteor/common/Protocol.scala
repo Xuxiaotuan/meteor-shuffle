@@ -38,15 +38,41 @@ object Protocol {
   // Master 协议（Client → Master）
   // ================================
 
-  /** 注册一个 shuffle，请求分区 slot 分配 */
+  /** 注册一个 shuffle，请求分区 slot 分配
+   *  @param numMappers 上游 mapper 总数（用于两阶段提交追踪） */
   final case class RegisterShuffle(
     shuffleId: ShuffleId,
-    numPartitions: Int
+    numPartitions: Int,
+    numMappers: Int = 1  // 默认 1（兼容旧调用）
   )
 
   /** RegisterShuffle 的响应 */
   final case class RegisterShuffleResponse(
     locations: Seq[PartitionLocation]
+  )
+
+  /** Mapper 完成信号（两阶段提交阶段一）
+   *  Client 在所有 partition 写完、finish() 后发送。
+   *  Master 追踪所有 mapper 完成情况。 */
+  final case class MapperEnd(
+    shuffleId: ShuffleId,
+    mapperId: Int           // 该 mapper 的 index（0-based）
+  )
+
+  final case class MapperEndResponse(
+    shuffleId: ShuffleId,
+    acknowledged: Boolean
+  )
+
+  /** Master 广播：所有 mapper 已完成，Worker 可以提交数据
+   *  （两阶段提交阶段二） */
+  final case class CommitShuffle(
+    shuffleId: ShuffleId
+  )
+
+  final case class CommitShuffleResponse(
+    shuffleId: ShuffleId,
+    success: Boolean
   )
 
   /** 请求重新分配某个分区（原 Worker 挂了） */
@@ -115,11 +141,19 @@ object Protocol {
     data: Array[Byte],
     checksum: Long = 0,                      // CRC32 of original uncompressed data
     replica: Option[WorkerAddress] = None,   // 副本同步目标 Worker 地址
-    compression: CompressionType = CompressNone  // 数据压缩算法
+    compression: CompressionType = CompressNone,  // 数据压缩算法
+    requireSyncReplica: Boolean = false      // 是否要求同步副本确认（一致性模式）
   )
 
   /** PushData 响应 */
   final case class PushDataResponse(
+    shuffleId: ShuffleId,
+    partitionIndex: Int,
+    success: Boolean
+  )
+
+  /** 副本同步完成确认（用于同步副本模式） */
+  final case class ReplicaAck(
     shuffleId: ShuffleId,
     partitionIndex: Int,
     success: Boolean
@@ -137,6 +171,53 @@ object Protocol {
     shuffleId: ShuffleId,
     partitionIndex: Int,
     data: Option[Array[Byte]],  // None = 数据还没就绪
+    fromReplica: Boolean = false
+  )
+
+  // ================================
+  // 流式/分块 Fetch（大数据集场景）
+  // ================================
+
+  /** FetchChunk: 按 chunk 拉取数据，支持流式传输 */
+  final case class FetchChunk(
+    shuffleId: ShuffleId,
+    partitionIndex: Int,
+    attemptNumber: Int,
+    chunkIndex: Int           // -1 = 获取 chunk 总数
+  )
+
+  /** FetchChunk 响应：单 chunk 数据 */
+  final case class FetchChunkResponse(
+    shuffleId: ShuffleId,
+    partitionIndex: Int,
+    chunkIndex: Int,           // 当前 chunk 索引
+    totalChunks: Int,          // chunk 总数
+    data: Array[Byte],         // 如果 data.isEmpty 表示没有更多数据
+    fromReplica: Boolean = false
+  )
+
+  /** 分块传输要求 */
+  final case class ChunkTransferRequest(
+    shuffleId: ShuffleId,
+    partitionIndex: Int,
+    attemptNumber: Int,
+    preferredChunkSize: Long = 64L * 1024 * 1024  // 默认 64MB
+  )
+
+  /** 批量 chunk 索引请求（流式拉取） */
+  final case class FetchChunkRange(
+    shuffleId: ShuffleId,
+    partitionIndex: Int,
+    attemptNumber: Int,
+    startChunk: Int,
+    endChunk: Int              // inclusive
+  )
+
+  final case class FetchChunkRangeResponse(
+    shuffleId: ShuffleId,
+    partitionIndex: Int,
+    chunks: Seq[Array[Byte]],  // 多个 chunk 的批量数据
+    totalChunks: Int,
     fromReplica: Boolean = false
   )
 

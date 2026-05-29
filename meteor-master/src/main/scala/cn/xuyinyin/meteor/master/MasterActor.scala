@@ -46,6 +46,8 @@ object MasterActor {
   final case class HandlePartitionCommitted(req: cn.xuyinyin.meteor.common.Protocol.PartitionCommitted) extends Command
   final case class HandleIsPartitionReady(req: IsPartitionReady, replyTo: ActorRef[IsPartitionReadyResponse]) extends Command
   final case class HandleReportWorkerFailure(req: ReportWorkerFailure) extends Command
+  final case class HandleMapperEnd(req: MapperEnd, replyTo: ActorRef[MapperEndResponse]) extends Command
+  final case class HandleCommitShuffleResponse(req: CommitShuffleResponse) extends Command
 
   // ----- 状态查询 -----
   final case class QueryWorkers(replyTo: ActorRef[WorkersQueryResponse]) extends Command
@@ -115,6 +117,10 @@ object MasterActor {
           HandleIsPartitionReady(ipr, replyTo.asInstanceOf[org.apache.pekko.actor.typed.ActorRef[IsPartitionReadyResponse]])
         case MasterActorCommand.WrappedReportWorkerFailure(rwf) =>
           HandleReportWorkerFailure(rwf)
+        case MasterActorCommand.WrappedMapperEnd(me, replyTo) =>
+          HandleMapperEnd(me, replyTo.asInstanceOf[org.apache.pekko.actor.typed.ActorRef[MapperEndResponse]])
+        case MasterActorCommand.WrappedCommitShuffleResponse(csr) =>
+          HandleCommitShuffleResponse(csr)
         case _ => ???
       }
     )
@@ -242,7 +248,7 @@ object MasterActor {
               )
             }
 
-            val event = ShuffleRegistered(req.shuffleId, req.numPartitions, locations)
+            val event = ShuffleRegistered(req.shuffleId, req.numPartitions, locations, req.numMappers)
             Metrics.MasterMetrics.shuffleRegistrations.inc()
             Metrics.MasterMetrics.shufflesActive.inc()
             ctx.log.info(s"Shuffle registered: ${req.shuffleId}, ${req.numPartitions} partitions (${workerList.size} workers, ${state.excludedWorkers.size} excluded)")
@@ -333,7 +339,8 @@ object MasterActor {
 
       // ==================== 查询分区是否就绪 ====================
       case HandleIsPartitionReady(req, replyTo) =>
-        val ready = state.committedPartitions.get(req.shuffleId).exists(_.contains(req.partitionIndex))
+        // 两阶段提交：只有当 shuffle 完全 committed（所有 mapper 完成）才返回 true
+        val ready = state.shuffleCommitted.contains(req.shuffleId)
         replyTo ! IsPartitionReadyResponse(ready)
         Effect.none
 
@@ -346,12 +353,60 @@ object MasterActor {
           Effect.persist(WorkerExcluded(req.workerId, req.errorMessage))
         } else {
           ctx.log.warn(s"Worker ${req.workerId} failure #$current/$maxFailures: ${req.errorMessage}")
-          // 只更新计数（不 persist，内存状态）
-          val newState = state.copy(workerFailureCounts = state.workerFailureCounts + (req.workerId -> current))
-          // 需要绕过 Effect 做 state mutation...实际上用 Effect.none 然后 state mutation
-          // EventSourcedBehavior 不支持直接修改 state，这里用简化处理
           Effect.none
         }
+
+      // ==================== MapperEnd（两阶段提交阶段一） ====================
+      case HandleMapperEnd(req, replyTo) =>
+        val sid = req.shuffleId
+        val event = MapperCompleted(sid, req.mapperId)
+        val alreadyDone = state.mapperCompletions.getOrElse(sid, Set.empty)
+        val newDone = alreadyDone + req.mapperId
+        val totalMappers = state.shuffleNumMappers.getOrElse(sid, 1)
+
+        ctx.log.info(s"MapperEnd: $sid mapper=${req.mapperId}, progress=${newDone.size}/$totalMappers")
+
+        if (newDone.size >= totalMappers) {
+          // 所有 mapper 完成 → 触发 CommitShuffle
+          ctx.log.info(s"All $totalMappers mappers completed for $sid, broadcasting CommitShuffle to workers")
+
+          // 找到该 shuffle 涉及的所有 worker
+          state.shuffles.get(sid).foreach { info =>
+            val workerSet = info.partitions.values.flatMap { loc =>
+              Seq(loc.primary) ++ loc.replica.toSeq
+            }.toSet
+
+            workerSet.foreach { addr =>
+              val workerPath = s"pekko://meteor-worker@${addr.host}:${addr.rpcPort}/user/worker"
+              ctx.log.info(s"Sending CommitShuffle to worker at $workerPath")
+              // 通过 actorSelection 发送 CommitShuffle
+              import org.apache.pekko.actor.typed.scaladsl.adapter._
+              val classicSystem = ctx.system.toClassic
+              import scala.concurrent.ExecutionContext.Implicits.global
+              classicSystem.actorSelection(workerPath).resolveOne(5.seconds).foreach { ref =>
+                ref ! CommitShuffle(sid)
+              }
+            }
+          }
+
+          // ShuffleCommitted 逻辑内嵌到 MapperCompleted 的 event handler 中
+          Effect.persist(event).thenRun { _ =>
+            replyTo ! MapperEndResponse(sid, acknowledged = true)
+          }
+        } else {
+          Effect.persist(event).thenRun { _ =>
+            replyTo ! MapperEndResponse(sid, acknowledged = true)
+          }
+        }
+
+      // ==================== CommitShuffle 响应 ====================
+      case HandleCommitShuffleResponse(req) =>
+        if (req.success) {
+          ctx.log.info(s"CommitShuffle acknowledged for ${req.shuffleId}")
+        } else {
+          ctx.log.warn(s"CommitShuffle failed for ${req.shuffleId}")
+        }
+        Effect.none
 
       // ==================== 状态查询 ====================
       case QueryWorkers(replyTo) =>
@@ -464,7 +519,7 @@ object MasterActor {
               PartitionLocation(PartitionId(req.shuffleId, i), 0, w.address, None)
             }
             replyTo ! RegisterShuffleResponse(locations)
-            applyEvent(state, ShuffleRegistered(req.shuffleId, req.numPartitions, locations))
+            applyEvent(state, ShuffleRegistered(req.shuffleId, req.numPartitions, locations, req.numMappers))
           }
         }
 
@@ -509,11 +564,6 @@ object MasterActor {
       case HandlePartitionCommitted(req) =>
         applyEvent(state, PartitionCommitRecorded(req.shuffleId, req.partitionIndex, req.workerId, req.dataSize))
 
-      case HandleIsPartitionReady(req, replyTo) =>
-        val ready = state.committedPartitions.get(req.shuffleId).exists(_.contains(req.partitionIndex))
-        replyTo ! IsPartitionReadyResponse(ready)
-        state
-
       case HandleReportWorkerFailure(req) =>
         val current = state.workerFailureCounts.getOrElse(req.workerId, 0) + 1
         if (current >= 5) {
@@ -521,6 +571,51 @@ object MasterActor {
         } else {
           state.copy(workerFailureCounts = state.workerFailureCounts + (req.workerId -> current))
         }
+
+      // ==================== MapperEnd（两阶段提交阶段一） ====================
+      case HandleMapperEnd(req, replyTo) =>
+        val sid = req.shuffleId
+        val alreadyDone = state.mapperCompletions.getOrElse(sid, Set.empty)
+        val newDone = alreadyDone + req.mapperId
+        val totalMappers = state.shuffleNumMappers.getOrElse(sid, 1)
+
+        ctx.log.info(s"[NonPersistent] MapperEnd: $sid mapper=${req.mapperId}, progress=${newDone.size}/$totalMappers")
+
+        val s1 = applyEvent(state, MapperCompleted(sid, req.mapperId))
+
+        if (newDone.size >= totalMappers) {
+          ctx.log.info(s"[NonPersistent] All $totalMappers mappers completed for $sid, committing")
+          state.shuffles.get(sid).foreach { info =>
+            val workerSet = info.partitions.values.flatMap { loc =>
+              Seq(loc.primary) ++ loc.replica.toSeq
+            }.toSet
+            workerSet.foreach { addr =>
+              val workerPath = s"pekko://meteor-worker@${addr.host}:${addr.rpcPort}/user/worker"
+              import org.apache.pekko.actor.typed.scaladsl.adapter._
+              val classicSystem = ctx.system.toClassic
+              import scala.concurrent.ExecutionContext.Implicits.global
+              classicSystem.actorSelection(workerPath).resolveOne(5.seconds).foreach { ref =>
+                ref ! CommitShuffle(sid)
+              }
+            }
+          }
+          val s2 = applyEvent(s1, ShuffleCommitted(sid))
+          replyTo ! MapperEndResponse(sid, acknowledged = true)
+          s2
+        } else {
+          replyTo ! MapperEndResponse(sid, acknowledged = true)
+          s1
+        }
+
+      case HandleCommitShuffleResponse(req) =>
+        ctx.log.info(s"[NonPersistent] CommitShuffle ack for ${req.shuffleId}: ${req.success}")
+        state
+
+      // ==================== 查询分区是否就绪（两阶段提交版本） ====================
+      case HandleIsPartitionReady(req, replyTo) =>
+        val ready = state.shuffleCommitted.contains(req.shuffleId)
+        replyTo ! IsPartitionReadyResponse(ready)
+        state
 
       // ==================== 状态查询 ====================
       case QueryWorkers(replyTo) =>

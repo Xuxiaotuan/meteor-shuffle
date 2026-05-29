@@ -97,16 +97,22 @@ object DiskMonitor {
     val dirStatuses = storageDirs.map { dirStr =>
       val path = java.nio.file.Paths.get(dirStr)
       if (Files.exists(path)) {
-        val store = path.getFileSystem.getFileStores.iterator()
-        var total = 0L
-        var free = 0L
-        while (store.hasNext) {
-          val fs = store.next()
-          total += fs.getTotalSpace
-          free += fs.getUsableSpace
+        try {
+          // 获取该目录所在挂载点的 FileStore（而非遍历所有 FileStore）
+          val fs = Files.getFileStore(path)
+          val total = fs.getTotalSpace
+          val usable = fs.getUsableSpace  // 非特权用户可用空间
+          val free  = fs.getUnallocatedSpace // 文件系统剩余空间（更准确）
+          val used = total - free
+          DirStatus(dirStr, total, free, if (total > 0) used.toDouble / total else 0.0)
+        } catch {
+          case _: Exception =>
+            // fallback: 用目录所在分区估算
+            val total = path.toFile.getTotalSpace
+            val free  = path.toFile.getFreeSpace
+            val used = total - free
+            DirStatus(dirStr, total, free, if (total > 0) used.toDouble / total else 0.0)
         }
-        val used = total - free
-        DirStatus(dirStr, total, free, if (total > 0) used.toDouble / total else 0.0)
       } else {
         DirStatus(dirStr, 0, 0, 0.0)
       }

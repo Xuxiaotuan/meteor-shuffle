@@ -158,7 +158,7 @@ cat ~/flink-1.19.3/log/flink-*-taskexecutor-*.out
 
 ## 性能基准
 
-> 测试环境: MacBook Air M2, 单 JVM, 内存文件系统
+> 测试环境: MacBook Air M3, 单 JVM, 内存文件系统
 
 ```
 PushData:   13,537 ops/s, 52.9 MB/s   (p50=41µs,  p99=159µs)
@@ -187,7 +187,7 @@ meteor-worker/StorageAdapterSpec      4  — PartitionWriter↔StorageAdapter
 **环境**:
 - Flink 1.19.3, Standalone 单节点
 - Scala 2.12.20 + Pekko 1.1.3
-- macOS (Apple Silicon), Java 21
+- macOS (Apple M3), Java 21
 - 模式: Local in-memory shuffle (Meteor Master 不可用，自动降级)
 
 **结果**: ✅ 全部 80 条数据正确处理，reduce 聚合准确

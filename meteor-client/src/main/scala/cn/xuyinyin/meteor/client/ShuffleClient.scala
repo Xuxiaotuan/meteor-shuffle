@@ -29,7 +29,16 @@ object ShuffleClient {
   final case class Register(
     shuffleId: ShuffleId,
     numPartitions: Int,
+    numMappers: Int = 1,  // 用于两阶段提交
     replyTo: ActorRef[RegisterShuffleResponse]
+  ) extends Command
+
+  /** Mapper 完成信号（两阶段提交阶段一）
+   *  Flink Task 在 finish() 时调用 */
+  final case class SignalMapperEnd(
+    shuffleId: ShuffleId,
+    mapperId: Int,
+    replyTo: ActorRef[MapperEndResponse]
   ) extends Command
 
   final case class Push(
@@ -65,6 +74,7 @@ object ShuffleClient {
   ) extends Command
 
   private final case class OnRegisterFailed(ex: Throwable, replyTo: ActorRef[RegisterShuffleResponse]) extends Command
+  private final case class OnMapperEndResult(resp: MapperEndResponse, replyTo: ActorRef[MapperEndResponse]) extends Command
 
   private final case class WorkerResolved(address: WorkerAddress, ref: org.apache.pekko.actor.ActorRef) extends Command
   private final case class WorkerResolveFailed(address: WorkerAddress, ex: Throwable) extends Command
@@ -92,14 +102,22 @@ object ShuffleClient {
     Behaviors.receiveMessage {
 
       // ==================== Register Shuffle ====================
-      case Register(shuffleId, numPartitions, replyTo) =>
-        ctx.log.info(s"Registering shuffle $shuffleId, $numPartitions partitions")
-        val req = RegisterShuffle(shuffleId, numPartitions)
-        // 创建临时 actor 接收 Master 响应
+      case Register(shuffleId, numPartitions, numMappers, replyTo) =>
+        ctx.log.info(s"Registering shuffle $shuffleId, $numPartitions partitions, $numMappers mappers")
+        val req = RegisterShuffle(shuffleId, numPartitions, numMappers)
         val adapter = ctx.messageAdapter[RegisterShuffleResponse] { resp =>
           OnRegisterResult(shuffleId, resp, replyTo)
         }
         masterRef ! MasterActorCommand.WrappedRegisterShuffle(req, adapter)
+        Behaviors.same
+
+      // ==================== SignalMapperEnd（两阶段提交） ====================
+      case SignalMapperEnd(shuffleId, mapperId, replyTo) =>
+        ctx.log.info(s"Signaling MapperEnd: $shuffleId mapper=$mapperId")
+        val adapter = ctx.messageAdapter[MapperEndResponse] { resp =>
+          OnMapperEndResult(resp, replyTo)
+        }
+        masterRef ! MasterActorCommand.WrappedMapperEnd(MapperEnd(shuffleId, mapperId), adapter)
         Behaviors.same
 
       // ==================== Push Data ====================
@@ -135,6 +153,15 @@ object ShuffleClient {
       case OnRegisterFailed(ex, replyTo) =>
         ctx.log.error(s"Register failed: ${ex.getMessage}")
         replyTo ! RegisterShuffleResponse(Seq.empty)
+        Behaviors.same
+
+      case OnMapperEndResult(resp, replyTo) =>
+        if (resp.acknowledged) {
+          ctx.log.info(s"MapperEnd acknowledged for ${resp.shuffleId}")
+        } else {
+          ctx.log.warn(s"MapperEnd not acknowledged for ${resp.shuffleId}")
+        }
+        replyTo ! resp
         Behaviors.same
 
       case OnPushResult(shuffleId, partitionIndex, success, replyTo, retryCount, data, compression, replicaAddr) =>

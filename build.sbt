@@ -66,6 +66,21 @@ lazy val meteorMaster = (project in file("meteor-master"))
   .settings(
     name := "meteor-master",
     Compile / mainClass := Some("cn.xuyinyin.meteor.master.MasterApp"),
+    assembly / mainClass := Some("cn.xuyinyin.meteor.master.MasterApp"),
+    assembly / assemblyMergeStrategy := {
+      case PathList("module-info.class") => MergeStrategy.discard
+      case PathList("META-INF", "versions", _*) => MergeStrategy.discard
+      case PathList("META-INF", "io.netty.versions.properties") => MergeStrategy.first
+      case PathList("META-INF", "native-image", _*) => MergeStrategy.first
+      case x if x.endsWith("module-info.class") => MergeStrategy.discard
+      case x if x.endsWith(".properties") => MergeStrategy.concat
+      case PathList("org", "iq80", "leveldb", _*) => MergeStrategy.first
+      case PathList("META-INF", "services", _*) => MergeStrategy.concat
+      case PathList("META-INF", "MANIFEST.MF") => MergeStrategy.discard
+      case x =>
+        val oldStrategy = (assembly / assemblyMergeStrategy).value
+        oldStrategy(x)
+    },
     libraryDependencies ++= Seq(
       "org.apache.pekko" %% "pekko-cluster-typed"          % pekkoVersion,
       "org.apache.pekko" %% "pekko-cluster-sharding-typed" % pekkoVersion,
@@ -91,6 +106,20 @@ lazy val meteorWorker = (project in file("meteor-worker"))
   .settings(
     name := "meteor-worker",
     Compile / mainClass := Some("cn.xuyinyin.meteor.worker.WorkerApp"),
+    assembly / mainClass := Some("cn.xuyinyin.meteor.worker.WorkerApp"),
+    assembly / assemblyMergeStrategy := {
+      case PathList("module-info.class") => MergeStrategy.discard
+      case PathList("META-INF", "versions", _*) => MergeStrategy.discard
+      case PathList("META-INF", "io.netty.versions.properties") => MergeStrategy.first
+      case PathList("META-INF", "native-image", _*) => MergeStrategy.first
+      case x if x.endsWith("module-info.class") => MergeStrategy.discard
+      case x if x.endsWith(".properties") => MergeStrategy.concat
+      case PathList("META-INF", "services", _*) => MergeStrategy.concat
+      case PathList("META-INF", "MANIFEST.MF") => MergeStrategy.discard
+      case x =>
+        val oldStrategy = (assembly / assemblyMergeStrategy).value
+        oldStrategy(x)
+    },
     libraryDependencies ++= Seq(
       "org.apache.pekko" %% "pekko-cluster-typed"       % pekkoVersion,
       "org.apache.pekko" %% "pekko-stream"              % pekkoVersion,

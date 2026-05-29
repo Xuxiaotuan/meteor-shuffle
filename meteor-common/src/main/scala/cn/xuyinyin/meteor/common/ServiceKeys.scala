@@ -40,6 +40,8 @@ object MasterActorCommand {
   final case class WrappedPartitionCommitted(pc: PartitionCommitted) extends MasterActorCommand
   final case class WrappedIsPartitionReady(ipr: IsPartitionReady, replyTo: org.apache.pekko.actor.typed.ActorRef[IsPartitionReadyResponse]) extends MasterActorCommand
   final case class WrappedReportWorkerFailure(rwf: ReportWorkerFailure) extends MasterActorCommand
+  final case class WrappedMapperEnd(me: MapperEnd, replyTo: org.apache.pekko.actor.typed.ActorRef[MapperEndResponse]) extends MasterActorCommand
+  final case class WrappedCommitShuffleResponse(csr: CommitShuffleResponse) extends MasterActorCommand
 }
 
 /**
@@ -54,4 +56,6 @@ object WorkerActorCommand {
   final case class WrappedReleaseSlots(rs: ReleaseSlots) extends WorkerActorCommand
   /** Master → Worker: 从副本恢复数据 */
   final case class WrappedRecoverFromReplica(rfr: RecoverFromReplica) extends WorkerActorCommand
+  /** Master → Worker: 两阶段提交——所有 mapper 完成，可以提交 */
+  final case class WrappedCommitShuffle(cs: CommitShuffle, replyTo: org.apache.pekko.actor.typed.ActorRef[CommitShuffleResponse]) extends WorkerActorCommand
 }
